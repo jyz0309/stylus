@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stylus"
+version = "0.1.0"
+description = "Learn user coding style from Git commit corrections and maintain a coding-style skill shared across agent tools."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Stylus Contributors" },
+]
+keywords = ["git", "coding-style", "ai", "agents", "codex", "cursor", "zcode", "claude", "llm", "developer-tools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Text Processing :: Linguistic",
+]
+dependencies = ["openai>=1.40"]
+
+[project.scripts]
+stylus = "stylus.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jyz0309/stylus"
+Repository = "https://github.com/jyz0309/stylus"
+Issues = "https://github.com/jyz0309/stylus/issues"
+Changelog = "https://github.com/jyz0309/stylus/releases"
+
+[tool.setuptools.packages.find]
+where = ["src"]
