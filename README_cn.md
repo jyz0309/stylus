@@ -66,6 +66,8 @@ Stylus 会观察你如何修改、收窄或纠正 Agent 生成的代码。每次
 - **OpenAI 兼容** —— 同时支持官方 OpenAI Responses API 和任意
   OpenAI 兼容的 Chat Completions 端点（DeepSeek、OpenRouter 等）。
 - **自定义Analyzer** —— 通过 `STYLUS_ANALYZER_CMD` 可替换为任意外部程序。
+- **忽略噪声文件** -- 排除密钥、lock 文件、生成产物等，不参与风格学习；直接复用仓库
+  的 `.gitignore`，另可选全局正则文件补充。
 - **非侵入式** —— 状态保存在 `~/.stylus` 下，绝不在仓库内部，因此不可能
   被误提交。hook 是非阻塞的，永远不会丢弃你的提交。
 - **可完全卸载** —— `stylus uninstall all` 一键清除 skill、hook 和 Git 配置。
@@ -205,6 +207,33 @@ Stylus 完全通过环境变量配置 —— 无需配置文件。
 | `STYLUS_CURSOR_SKILLS_ROOT` | 覆盖 cursor 的 skill 根目录                    | `~/.cursor/skills`               |
 | `STYLUS_ZCODE_SKILLS_ROOT`  | 覆盖 zcode 的 skill 根目录                     | `~/.agents/skills`               |
 | `STYLUS_CLAUDE_SKILLS_ROOT` | 覆盖 claude 的 skill 根目录                    | `~/.claude/skills`               |
+
+### 忽略文件
+
+有些文件不应参与 Stylus 的风格学习--密钥、lock 文件、生成产物、第三方代码。
+Stylus 合并两处忽略规则，并**同时**作用于记录的 agent 基线（`stylus record`）
+与分析的提交（`stylus analyze`），保证两侧对比口径一致。
+
+- **`~/.stylus/ignore`**（全局，跨仓库）：每行是一个 **Python 正则表达式**
+  （用 `re.search` 匹配），同时匹配相对于仓库根的路径（`src/pkg/mod.py`）与
+  裸文件名（`mod.py`）。用于跨仓库的通用规则（如 `\.env$`、`\.pem$`）。
+- **仓库自带的 `.gitignore`**：由 Git 本身通过 `git check-ignore --no-index`
+  匹配，**无需额外配置**，直接复用你已有的忽略规则。由于使用了 `--no-index`，
+  规则对**已跟踪文件同样生效**（Git 默认对已跟踪文件忽略 `.gitignore`，否则像
+  已提交的 `app.log` 即便有 `*.log` 规则也会漏进 Stylus 的 diff）。
+
+命中任一来源即排除。`~/.stylus/ignore` 中的非法正则会被跳过并打印警告，不会中断
+运行。当既无全局忽略文件、仓库也无 `.gitignore` 时行为不变--所有文件都会被捕获。
+
+`~/.stylus/ignore` 示例（用于 `.gitignore` 未覆盖的规则）：
+
+```
+# .gitignore 未覆盖的密钥
+\.pem$
+
+# 按文件名匹配任意位置
+minified\.js$
+```
 
 ## Analyzer 
 

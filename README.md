@@ -73,6 +73,8 @@ If your commit reproduces the agent baseline verbatim, Stylus skips analysis
 - **OpenAI-compatible** — supports the official OpenAI Responses API *and* any
   OpenAI-compatible Chat Completions endpoint (DeepSeek, OpenRouter, …).
 - **Custom analyzer** — swap in any program via `STYLUS_ANALYZER_CMD`.
+- **Ignore noise** — exclude secrets, lock files, and generated artifacts from
+  learning; reuses your repo's `.gitignore` plus an optional global regex file.
 - **Non-invasive** — state lives under `~/.stylus`, never inside your repo, so
   it can never be accidentally committed. The hook is non-blocking and never
   discards a commit.
@@ -221,6 +223,41 @@ required.
 | `STYLUS_CURSOR_SKILLS_ROOT` | Override the cursor skills root                              | `~/.cursor/skills`               |
 | `STYLUS_ZCODE_SKILLS_ROOT`  | Override the zcode skills root                               | `~/.agents/skills`               |
 | `STYLUS_CLAUDE_SKILLS_ROOT` | Override the claude skills root                              | `~/.claude/skills`               |
+
+### Ignoring files
+
+Some files should never feed Stylus' style learning - secrets, lock files,
+generated artifacts, vendored code. Stylus merges two sources of ignore rules
+and applies them to **both** the recorded agent baseline (`stylus record`) and
+the analyzed commit (`stylus analyze`), so the two sides always compare on the
+same footing.
+
+- **`~/.stylus/ignore`** (global, cross-repository): each non-empty,
+  non-comment line is a **Python regular expression** (matched with
+  `re.search`), tested against both the path relative to the repository root
+  (`src/pkg/mod.py`) and the bare file name (`mod.py`). Use this for concerns
+  that span repos (e.g. `\.env$`, `\.pem$`).
+- **The repository's own `.gitignore`**: matched by Git itself via
+  `git check-ignore --no-index`. You do **not** configure anything extra -
+  Stylus reuses your existing ignore rules. Because `--no-index` is used,
+  patterns apply to **already-tracked files too** (Git normally exempts tracked
+  files from `.gitignore`, which would let e.g. a committed `app.log` leak into
+  the Stylus diff despite a `*.log` pattern).
+
+A path matching either source is excluded. Invalid regex lines in
+`~/.stylus/ignore` are skipped with a warning rather than aborting the run. When
+neither a global ignore file nor a `.gitignore` exists, behavior is unchanged -
+every file is captured.
+
+Example `~/.stylus/ignore` (for rules not already covered by `.gitignore`):
+
+```
+# secrets not caught by .gitignore
+\.pem$
+
+# by filename anywhere
+minified\.js$
+```
 
 ## Analyzer
 
