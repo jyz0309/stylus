@@ -249,6 +249,16 @@ def run_analyze(cwd: Path, commit: str, debug: bool = False) -> int:
     raw_baseline_diff = baseline_diff_path.read_text(encoding="utf-8") if baseline_diff_path.exists() else ""
     raw_user_diff = gitutil.commit_diff(root, resolved_commit)
 
+    # Apply ignore patterns to both sides so the comparison is consistent with
+    # the recorded baseline (which was already filtered at record time). Reading
+    # the baseline back and re-filtering keeps things correct even if the ignore
+    # rules changed after the baseline was captured.
+    ignore = gitutil.load_ignore(root)
+    if not ignore.empty:
+        keep = lambda path: not ignore.matches(path)
+        raw_baseline_diff = gitutil.filter_diff_blocks(raw_baseline_diff, keep)
+        raw_user_diff = gitutil.filter_diff_blocks(raw_user_diff, keep)
+
     if diffs_equivalent(raw_baseline_diff, raw_user_diff):
         state.append_analysis(repo, branch, AnalysisRecord(
             commit=resolved_commit,

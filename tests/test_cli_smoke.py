@@ -292,6 +292,78 @@ class CliSmokeTests(unittest.TestCase):
         self.assertTrue(diffs_equivalent("", ""))
         self.assertFalse(diffs_equivalent("", "diff --git a/f.txt b/f.txt\n+new\n"))
 
+    def test_analyze_filters_ignored_files_from_both_diffs(self):
+        """Ignored files must not reach the analyzer on either side.
+
+        Records a baseline touching app.py + config.lock (lock ignored via the
+        repo's .gitignore), then commits a correction touching the same files.
+        The fake analyzer captures the input; both diffs must contain app.py
+        but not config.lock. This exercises the .gitignore path on the analyze
+        side for already-tracked files (which require check-ignore --no-index).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "repo"
+            root.mkdir()
+            stylus_home = tmp_path / "stylus-home"
+            codex_home = tmp_path / "codex-home"
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path.cwd() / "src"),
+                "CODEX_HOME": str(codex_home),
+                "HOME": str(tmp_path / "home"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+                "STYLUS_HOME": str(stylus_home),
+            }
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "stylus@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Stylus Test"], cwd=root, check=True)
+            (root / "app.py").write_text("v1\n")
+            (root / "config.lock").write_text("v1\n")
+            subprocess.run(["git", "add", "app.py", "config.lock"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, stdout=subprocess.PIPE)
+
+            subprocess.run([sys.executable, "-m", "stylus", "init"], cwd=root, env=env, check=True)
+            subprocess.run([sys.executable, "-m", "stylus", "install", "skill"], cwd=root, env=env, check=True)
+
+            # Project-level ignore via .gitignore (no global ignore file).
+            (root / ".gitignore").write_text("*.lock\n")
+
+            # Agent baseline: modify both files (only app.py should be recorded).
+            (root / "app.py").write_text("agent\n")
+            (root / "config.lock").write_text("agent\n")
+            subprocess.run(
+                [sys.executable, "-m", "stylus", "record", "--summary", "agent edit"],
+                cwd=root, env=env, check=True,
+            )
+
+            # User correction: change app.py further, also touch the lock file.
+            (root / "app.py").write_text("user\n")
+            (root / "config.lock").write_text("user\n")
+            subprocess.run(["git", "add", "app.py", "config.lock"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "correction"], cwd=root, env=env, check=True, stdout=subprocess.PIPE)
+
+            captured: dict[str, object] = {}
+
+            from stylus.cli import run_analyze
+            from stylus.analyzer import FakeAnalyzerProvider, AnalyzerOutput
+
+            class CapturingProvider(FakeAnalyzerProvider):
+                def analyze(self, analyzer_input):  # type: ignore[override]
+                    captured["baseline_diff"] = analyzer_input.baseline_diff
+                    captured["user_diff"] = analyzer_input.user_diff
+                    return AnalyzerOutput(preferences=[], obsolete_preferences=[], notes=[])
+
+            with patch("stylus.cli.provider_from_env", return_value=CapturingProvider()), \
+                 patch.dict(os.environ, {"STYLUS_HOME": str(stylus_home)}):
+                rc = run_analyze(root, "HEAD", debug=False)
+            self.assertEqual(rc, 0)
+
+            self.assertIn("app.py", str(captured["baseline_diff"]))
+            self.assertIn("app.py", str(captured["user_diff"]))
+            self.assertNotIn("config.lock", str(captured["baseline_diff"]))
+            self.assertNotIn("config.lock", str(captured["user_diff"]))
+
     def test_install_skill_default_installs_all_four_and_prints_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
