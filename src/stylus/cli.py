@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ from .analyzer import (
     provider_name,
 )
 from .hooks import (
+    BEGIN,
+    END,
     global_hooks_dir,
     install_global_git_config,
     install_global_post_commit_hook,
@@ -29,7 +32,8 @@ from .hooks import (
 )
 from .paths import diffs_dir as diffs_dir_for
 from .paths import evidence_path
-from .skill import TARGETS, SkillStore
+from .paths import stylus_home
+from .skill import TARGETS, SkillStore, count_preferences
 from .state import AnalysisRecord, BaselineChange, StylusState
 
 
@@ -91,10 +95,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the analyzer provider, its input summary, and the parsed output "
         "for diagnostics. Does not change what gets written to preferences.",
     )
+    analyze.add_argument(
+        "--background",
+        action="store_true",
+        help="run analysis in a detached process and return immediately",
+    )
 
     record = subparsers.add_parser("record", help="record the latest agent-produced diff as a baseline")
     record.add_argument("--summary", default="", help="short description of the agent change")
     record.add_argument("--task", default="", help="optional agent task description")
+
+    subparsers.add_parser("status", help="show Stylus installation, baselines, and learned preferences")
+    subparsers.add_parser("list", help="list learned coding-style preferences")
 
     return parser
 
@@ -126,10 +138,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_uninstall_all(args.target)
 
     if args.command == "analyze":
+        if args.background:
+            return run_analyze_in_background(cwd, args.commit, args.debug)
         return run_analyze(cwd, args.commit, args.debug)
 
     if args.command == "record":
         return run_record(cwd, args.summary, args.task)
+
+    if args.command == "status":
+        return run_status(cwd)
+
+    if args.command == "list":
+        return run_list()
 
     return 0
 
@@ -226,6 +246,47 @@ def run_uninstall_all(targets: Sequence[str] | None = None) -> int:
     return 0
 
 
+def run_analyze_in_background(cwd: Path, commit: str, debug: bool = False) -> int:
+    root = gitutil.repo_root(cwd)
+    resolved_commit = gitutil.resolve_commit(root, commit)
+    log_path = stylus_home() / "analysis.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "stylus",
+        "analyze",
+        "--commit",
+        resolved_commit,
+    ]
+    if debug:
+        command.append("--debug")
+
+    popen_options: dict[str, object] = {
+        "cwd": root,
+        "stdin": subprocess.DEVNULL,
+        "stderr": subprocess.STDOUT,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        popen_options["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        popen_options["start_new_session"] = True
+
+    try:
+        with log_path.open("ab") as log:
+            popen_options["stdout"] = log
+            subprocess.Popen(command, **popen_options)
+    except OSError as exc:
+        print(f"Stylus failed to start background analysis: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Stylus started background analysis for commit {resolved_commit}. Log: {log_path}")
+    return 0
+
+
 def run_analyze(cwd: Path, commit: str, debug: bool = False) -> int:
     root = gitutil.repo_root(cwd)
     repo = gitutil.repo_id(root)
@@ -294,6 +355,7 @@ def run_analyze(cwd: Path, commit: str, debug: bool = False) -> int:
         if debug:
             _print_debug_output(output)
         SkillStore().merge_preferences(output.preferences, output.obsolete_preferences)
+        _sync_installed_targets()
         _append_evidence(output.preferences)
         result = "updated"
     except RuntimeError as exc:
@@ -464,4 +526,110 @@ def run_record(cwd: Path, summary: str, task: str) -> int:
     ))
     state.save()
     print(f"Recorded agent baseline {digest} for {branch}.")
+    return 0
+
+
+def _sync_installed_targets() -> list[str]:
+    """Sync the codex skill to other targets that already have it installed.
+
+    Called after a successful analysis so learned preferences propagate to
+    cursor/zcode/claude without waiting for a manual `install skill`. Targets
+    without an existing skill directory are skipped (no auto-install).
+    Returns the names of the targets that were synced.
+    """
+    codex_store = SkillStore(target="codex")
+    synced: list[str] = []
+    for target in TARGETS:
+        if target == "codex":
+            continue
+        store = SkillStore(target=target)
+        if store.skill_dir.exists():
+            codex_store.sync_to(store)
+            synced.append(target)
+    return synced
+
+
+def run_status(cwd: Path) -> int:
+    """Print a full status report: skill install, hook/config, baseline, preferences."""
+    print("Stylus status\n")
+
+    # --- Skill ---
+    print("Skill:")
+    for target in TARGETS:
+        store = SkillStore(target=target)
+        if store.skill_dir.exists():
+            print(f"  {target}: installed  {store.skill_dir}")
+        else:
+            print(f"  {target}: not installed")
+    print()
+
+    # --- Hook + config ---
+    print("Hook:")
+    hook = global_hooks_dir() / "post-commit"
+    if hook.exists() and BEGIN in hook.read_text(encoding="utf-8") and END in hook.read_text(encoding="utf-8"):
+        print("  global post-commit hook: installed")
+    else:
+        print("  global post-commit hook: not installed")
+    hooks_path = global_hooks_dir()
+    result = subprocess.run(
+        ["git", "config", "--global", "core.hooksPath"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if result.returncode == 0:
+        current = result.stdout.strip()
+        if current == str(hooks_path):
+            print(f"  core.hooksPath: {hooks_path} (Stylus)")
+        else:
+            print(f"  core.hooksPath: {current} (not Stylus)")
+    else:
+        print("  core.hooksPath: not set")
+    print()
+
+    # --- Baseline (requires a Git repo) ---
+    try:
+        root = gitutil.repo_root(cwd)
+    except RuntimeError:
+        print("Baseline: not a Git repository (skipped)\n")
+    else:
+        repo = gitutil.repo_id(root)
+        branch = gitutil.current_branch(root)
+        print(f"Baseline (repo: {root}, branch: {branch}):")
+        state = StylusState.load_or_create()
+        baseline = state.get_last_baseline(repo, branch)
+        if baseline is None:
+            print("  last agent baseline: none recorded")
+        else:
+            summary = baseline.summary or "(no summary)"
+            print(f"  last agent baseline: {baseline.id} ({baseline.created_at}) \"{summary}\"")
+        counts = state.analysis_counts(repo, branch)
+        total = sum(counts.values())
+        if counts:
+            breakdown = ", ".join(f"{n} {r}" for r, n in sorted(counts.items()))
+            print(f"  analyses on this branch: {total} ({breakdown})")
+        else:
+            print("  analyses on this branch: 0")
+        print()
+
+    # --- Preferences ---
+    print("Preferences:")
+    prefs_path = SkillStore(target="codex").references_dir / "preferences.md"
+    if prefs_path.exists():
+        prefs_text = prefs_path.read_text(encoding="utf-8")
+        pref_count, topic_count = count_preferences(prefs_text)
+        if pref_count:
+            print(f"  {pref_count} preferences across {topic_count} topics (codex is source of truth)")
+        else:
+            print("  no preferences learned yet")
+    else:
+        print("  no Stylus skill found (run `stylus install skill`)")
+    return 0
+
+
+def run_list() -> int:
+    """Print the learned preferences from the codex skill (single source of truth)."""
+    prefs_path = SkillStore(target="codex").references_dir / "preferences.md"
+    if not prefs_path.exists():
+        print("No Stylus skill found. Run `stylus install skill` first.")
+        return 0
+    print(prefs_path.read_text(encoding="utf-8"), end="")
     return 0

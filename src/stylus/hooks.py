@@ -108,9 +108,9 @@ def _install_post_commit_hook_file(hook: Path) -> Path:
     python_executable = shlex.quote(sys.executable)
     block = f"""{BEGIN}
 {export_line}if command -v stylus >/dev/null 2>&1; then
-  stylus analyze --commit HEAD || echo "stylus: analysis failed; commit preserved" >&2
+  stylus analyze --commit HEAD --background || echo "stylus: failed to start background analysis; commit preserved" >&2
 else
-  {python_executable} -m stylus analyze --commit HEAD || echo "stylus: analysis failed; commit preserved" >&2
+  {python_executable} -m stylus analyze --commit HEAD --background || echo "stylus: failed to start background analysis; commit preserved" >&2
 fi
 {END}
 """

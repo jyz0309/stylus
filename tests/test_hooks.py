@@ -19,7 +19,7 @@ class HookTests(unittest.TestCase):
 
             hook = git_dir / "hooks" / "post-commit"
             self.assertTrue(hook.exists())
-            self.assertIn("stylus analyze --commit HEAD", hook.read_text())
+            self.assertIn("stylus analyze --commit HEAD --background", hook.read_text())
             self.assertTrue(os.access(hook, os.X_OK))
 
     def test_preserves_existing_hook(self):
@@ -45,7 +45,7 @@ class HookTests(unittest.TestCase):
             hook = install_global_post_commit_hook(home=home)
 
             self.assertEqual(hook, home / ".config" / "stylus" / "git-hooks" / "post-commit")
-            self.assertIn("stylus analyze --commit HEAD", hook.read_text())
+            self.assertIn("stylus analyze --commit HEAD --background", hook.read_text())
             self.assertTrue(os.access(hook, os.X_OK))
 
     def test_installs_global_git_config(self):

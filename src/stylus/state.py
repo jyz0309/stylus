@@ -74,3 +74,12 @@ class StylusState:
         analyses.append(asdict(record))
         if len(analyses) > MAX_ANALYSES_PER_BRANCH:
             del analyses[:-MAX_ANALYSES_PER_BRANCH]
+
+    def analysis_counts(self, repo_id: str, branch: str) -> dict[str, int]:
+        """Count analyses on a branch grouped by ``result`` (e.g. updated/skipped/failed)."""
+        analyses = self._branch(repo_id, branch).get("analyses", [])
+        counts: dict[str, int] = {}
+        for record in analyses:
+            result = record.get("result", "unknown") if isinstance(record, dict) else "unknown"
+            counts[result] = counts.get(result, 0) + 1
+        return counts

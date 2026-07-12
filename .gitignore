@@ -42,3 +42,5 @@ coverage.xml
 
 # Stylus local state (never belongs to the repo)
 .stylus/
+
+.zcode/

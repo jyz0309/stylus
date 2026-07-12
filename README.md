@@ -56,8 +56,9 @@ code that looks more like yours *before* you have to correct it.
 1. After an agent finishes its changes, Stylus automatically runs
    `stylus record`. Stylus captures the working-tree diff as the **baseline**
    for that branch.
-2. You review, revise, and `git commit`. A non-blocking `post-commit` hook
-   triggers `stylus analyze --commit HEAD`.
+2. You review, revise, and `git commit`. The `post-commit` hook starts
+   `stylus analyze --commit HEAD --background` and returns without waiting for
+   the analyzer.
 3. Stylus compares your commit against the recorded baseline, asks the
    configured analyzer to extract reusable preferences, and merges them into the
    stylus skill under the installed agents.
@@ -123,7 +124,7 @@ stylus record --summary "agent changed the helper"
 
 # 2. You review, revise, and commit your correction.
 git commit -m "correction"
-#    ^ the post-commit hook runs `stylus analyze --commit HEAD` automatically
+#    ^ the post-commit hook starts analysis in the background
 ```
 
 That's it. The next agent session in that repo will read the updated
@@ -145,6 +146,8 @@ Commands:
   uninstall all        Remove skill + hook + config in one step
   record               Record the latest agent-produced diff as a baseline
   analyze              Analyze a committed revision against the baseline
+  status               Show installation, baseline, and learned-preference summary
+  list                 Print the learned coding-style preferences
 ```
 
 ### `install skill`
@@ -181,8 +184,9 @@ stylus install skill --target cursor --target zcode
 
 `install hook` writes the global hook file at
 `~/.config/stylus/git-hooks/post-commit`. `install config` sets Git's global
-`core.hooksPath` to that directory. The hook is **non-blocking**: analysis
-failures print a warning and preserve the commit.
+`core.hooksPath` to that directory. The hook is **non-blocking**: it only waits
+for the background process to start, then returns. Analysis output and failures
+are appended to `~/.stylus/analysis.log` and never discard the commit.
 
 ### `record`
 
@@ -204,6 +208,35 @@ preferences. Normally invoked by the hook, but you can run it manually:
 ```bash
 stylus analyze --commit HEAD
 stylus analyze --commit HEAD --debug   # show provider, input sizes, and output
+stylus analyze --commit HEAD --background  # start analysis and return immediately
+```
+
+Background mode resolves `HEAD` to its commit SHA before starting the detached
+process, so a later commit cannot change which revision is analyzed. Its output
+is appended to `~/.stylus/analysis.log`.
+
+### `status`
+
+Prints a full status report in one place: which agent targets have the skill
+installed, whether the global post-commit hook and `core.hooksPath` are
+configured, the last recorded baseline for the current branch (with analysis
+counts), and how many preferences have been learned.
+
+```bash
+stylus status
+```
+
+Run it any time Stylus seems quiet - it is the fastest way to confirm the
+learning loop is wired up and to see how many preferences it has accumulated.
+
+### `list`
+
+Prints the learned coding-style preferences from the codex skill (the single
+source of truth), grouped by topic with confidence tags. Use it to review what
+Stylus has learned without opening the skill files manually.
+
+```bash
+stylus list
 ```
 
 ## Configuration
@@ -215,7 +248,7 @@ required.
 | --------------------------- | ------------------------------------------------------------ | -------------------------------- |
 | `STYLUS_HOME`               | Root directory for state, diffs, and the evidence log        | `~/.stylus`                      |
 | `OPENAI_API_KEY`            | Enable the OpenAI LLM analyzer                               | *(unset → local analyzer)*       |
-| `STYLUS_OPENAI_MODEL`       | Model name for the OpenAI analyzer                           | `gpt-5.2`                        |
+| `STYLUS_OPENAI_MODEL`       | Model name for the OpenAI analyzer                           | `gpt-5.5`                        |
 | `STYLUS_OPENAI_BASE_URL`    | OpenAI-compatible base URL                                   | `https://api.openai.com/v1`      |
 | `STYLUS_ANALYZER_CMD`       | External analyzer command (highest priority)                 | *(unset)*                        |
 | `STYLUS_MAX_DIFF_BYTES`     | Per-diff byte limit sent to the analyzer                     | `200000`                         |
@@ -382,7 +415,7 @@ Stylus is a standard Python package using `src/` layout.
 git clone https://github.com/jyz0309/stylus.git
 cd stylus
 pip install -e . pytest
-pytest                       # run the full test suite (64 tests)
+pytest                       # run the full test suite
 ```
 
 ## Contributing

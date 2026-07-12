@@ -154,6 +154,17 @@ def _preference_line_present(content: str, instruction: str) -> bool:
     return False
 
 
+def count_preferences(prefs_text: str) -> tuple[int, int]:
+    """Return (preference_count, topic_count) from a ``preferences.md`` body.
+
+    A preference is any ``- [confidence] instruction`` bullet; a topic is any
+    ``## heading``. Used by ``stylus status`` to summarize learned preferences.
+    """
+    pref_count = len(_PREF_LINE_RE.findall(prefs_text))
+    topic_count = len(re.findall(r"^## ", prefs_text, re.MULTILINE))
+    return pref_count, topic_count
+
+
 def _remove_preference_line(content: str, instruction: str) -> str:
     pattern = re.compile(
         rf"^- \[[^\]]+\] {re.escape(instruction)}\n",

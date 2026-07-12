@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +16,7 @@ from stylus.analyzer import (
     provider_from_env,
     provider_name,
 )
-from stylus.cli import diffs_equivalent, truncate_diff
+from stylus.cli import diffs_equivalent, run_analyze_in_background, truncate_diff
 from stylus.paths import diffs_dir as diffs_dir_for
 from stylus.paths import repo_hash, state_path, stylus_home
 
@@ -34,6 +35,45 @@ class CliSmokeTests(unittest.TestCase):
             result = truncate_diff("0123456789abcdef", "user_diff")
 
         self.assertEqual(result, "0123456789abcdef")
+
+    def test_analyze_background_resolves_commit_and_detaches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "stylus@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Stylus Test"], cwd=root, check=True)
+            (root / "example.txt").write_text("one\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, stdout=subprocess.PIPE)
+            resolved_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                text=True,
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.strip()
+
+            with patch.dict(os.environ, {"STYLUS_HOME": str(tmp_path / "stylus-home")}):
+                with patch("stylus.cli.gitutil.repo_root", return_value=root.resolve()):
+                    with patch("stylus.cli.gitutil.resolve_commit", return_value=resolved_commit):
+                        with patch("stylus.cli.subprocess.Popen") as popen:
+                            result = run_analyze_in_background(root, "HEAD")
+
+            self.assertEqual(result, 0)
+            command = popen.call_args.args[0]
+            options = popen.call_args.kwargs
+            self.assertEqual(command[-1], resolved_commit)
+            self.assertEqual(options["cwd"], root.resolve())
+            self.assertIs(options["stdin"], subprocess.DEVNULL)
+            self.assertIs(options["stderr"], subprocess.STDOUT)
+            self.assertTrue(options["close_fds"])
+            self.assertEqual(Path(options["stdout"].name), tmp_path / "stylus-home" / "analysis.log")
+            if os.name == "nt":
+                self.assertTrue(options["creationflags"])
+            else:
+                self.assertTrue(options["start_new_session"])
 
     def test_module_help_runs(self):
         result = subprocess.run(
@@ -182,6 +222,8 @@ class CliSmokeTests(unittest.TestCase):
                 "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
                 "STYLUS_HOME": str(tmp_path / "stylus-home"),
             }
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("STYLUS_ANALYZER_CMD", None)
             subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.PIPE)
             subprocess.run(["git", "config", "user.email", "stylus@example.com"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.name", "Stylus Test"], cwd=root, check=True)
@@ -208,6 +250,9 @@ class CliSmokeTests(unittest.TestCase):
 
             preferences = tmp_path / "codex-home" / "skills" / "stylus" / "references" / "preferences.md"
             self.assertTrue(preferences.exists())
+            deadline = time.monotonic() + 5
+            while "Review user edits" not in preferences.read_text() and time.monotonic() < deadline:
+                time.sleep(0.05)
             self.assertIn("Review user edits", preferences.read_text())
 
     def test_hook_skips_analysis_when_commit_matches_agent_baseline(self):
@@ -223,6 +268,8 @@ class CliSmokeTests(unittest.TestCase):
                 "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
                 "STYLUS_HOME": str(tmp_path / "stylus-home"),
             }
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("STYLUS_ANALYZER_CMD", None)
             subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.PIPE)
             subprocess.run(["git", "config", "user.email", "stylus@example.com"], cwd=root, check=True)
             subprocess.run(["git", "config", "user.name", "Stylus Test"], cwd=root, check=True)
@@ -249,14 +296,19 @@ class CliSmokeTests(unittest.TestCase):
             self.assertTrue(preferences.exists())
             self.assertNotIn("Review user edits", preferences.read_text())
 
-            with patch.dict(os.environ, {"STYLUS_HOME": str(tmp_path / "stylus-home")}):
-                state = json.loads(state_path().read_text())
-            results = [
-                analysis["result"]
-                for repo in state.get("repositories", {}).values()
-                for branch in repo.get("branches", {}).values()
-                for analysis in branch.get("analyses", [])
-            ]
+            results: list[str] = []
+            deadline = time.monotonic() + 5
+            while not results and time.monotonic() < deadline:
+                with patch.dict(os.environ, {"STYLUS_HOME": str(tmp_path / "stylus-home")}):
+                    state = json.loads(state_path().read_text())
+                results = [
+                    analysis["result"]
+                    for repo in state.get("repositories", {}).values()
+                    for branch in repo.get("branches", {}).values()
+                    for analysis in branch.get("analyses", [])
+                ]
+                if not results:
+                    time.sleep(0.05)
             self.assertIn("skipped", results)
             self.assertNotIn("updated", results)
 
@@ -877,6 +929,277 @@ class CliSmokeTests(unittest.TestCase):
                 env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             )
             self.assertNotEqual(check.returncode, 0)
+
+    def test_analyze_syncs_preferences_to_installed_targets(self):
+        """After analyze, learned preferences propagate to all installed targets."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "repo"
+            root.mkdir()
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path.cwd() / "src"),
+                "CODEX_HOME": str(tmp_path / "codex-home"),
+                "STYLUS_CURSOR_SKILLS_ROOT": str(tmp_path / "cursor-home" / "skills"),
+                "STYLUS_ZCODE_SKILLS_ROOT": str(tmp_path / "agents-home" / "skills"),
+                "STYLUS_CLAUDE_SKILLS_ROOT": str(tmp_path / "claude-home" / "skills"),
+                "HOME": str(tmp_path / "home"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+                "STYLUS_HOME": str(tmp_path / "stylus-home"),
+                "PATH": os.environ.get("PATH", ""),
+            }
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("STYLUS_ANALYZER_CMD", None)
+
+            subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "stylus@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Stylus Test"], cwd=root, check=True)
+            (root / "example.txt").write_text("one\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, stdout=subprocess.PIPE)
+
+            subprocess.run([sys.executable, "-m", "stylus", "init"], cwd=root, env=env, check=True)
+            subprocess.run([sys.executable, "-m", "stylus", "install", "skill"], cwd=root, env=env, check=True)
+            (root / "example.txt").write_text("two\n")
+            subprocess.run(
+                [sys.executable, "-m", "stylus", "record", "--summary", "agent changed text"],
+                cwd=root, env=env, check=True,
+            )
+            (root / "example.txt").write_text("three\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "user correction"], cwd=root, env=env, check=True, stdout=subprocess.PIPE)
+
+            # cursor/zcode/claude skill dirs exist before analyze.
+            cursor_prefs = tmp_path / "cursor-home" / "skills" / "stylus" / "references" / "preferences.md"
+            zcode_prefs = tmp_path / "agents-home" / "skills" / "stylus" / "references" / "preferences.md"
+            claude_prefs = tmp_path / "claude-home" / "skills" / "stylus" / "references" / "preferences.md"
+            self.assertTrue(cursor_prefs.exists())
+            self.assertTrue(zcode_prefs.exists())
+            self.assertTrue(claude_prefs.exists())
+
+            # Analyze learns a preference (FakeAnalyzerProvider) and syncs it.
+            result = subprocess.run(
+                [sys.executable, "-m", "stylus", "analyze", "--commit", "HEAD"],
+                cwd=root, env=env,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            # The learned preference must appear in every installed target.
+            for prefs in (cursor_prefs, zcode_prefs, claude_prefs):
+                self.assertIn("Review user edits", prefs.read_text())
+
+    def test_analyze_does_not_sync_to_uninstalled_targets(self):
+        """When only codex is installed, analyze must not auto-install other targets."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "repo"
+            root.mkdir()
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path.cwd() / "src"),
+                "CODEX_HOME": str(tmp_path / "codex-home"),
+                "STYLUS_CURSOR_SKILLS_ROOT": str(tmp_path / "cursor-home" / "skills"),
+                "HOME": str(tmp_path / "home"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+                "STYLUS_HOME": str(tmp_path / "stylus-home"),
+                "PATH": os.environ.get("PATH", ""),
+            }
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("STYLUS_ANALYZER_CMD", None)
+
+            subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "stylus@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Stylus Test"], cwd=root, check=True)
+            (root / "example.txt").write_text("one\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, stdout=subprocess.PIPE)
+
+            subprocess.run([sys.executable, "-m", "stylus", "init"], cwd=root, env=env, check=True)
+            subprocess.run([sys.executable, "-m", "stylus", "install", "skill", "--target", "codex"], cwd=root, env=env, check=True)
+            (root / "example.txt").write_text("two\n")
+            subprocess.run(
+                [sys.executable, "-m", "stylus", "record", "--summary", "agent changed text"],
+                cwd=root, env=env, check=True,
+            )
+            (root / "example.txt").write_text("three\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "user correction"], cwd=root, env=env, check=True, stdout=subprocess.PIPE)
+
+            subprocess.run(
+                [sys.executable, "-m", "stylus", "analyze", "--commit", "HEAD"],
+                cwd=root, env=env, check=True, stdout=subprocess.PIPE,
+            )
+
+            # Cursor was never installed, so it must not exist after analyze.
+            cursor_skill = tmp_path / "cursor-home" / "skills" / "stylus"
+            self.assertFalse(cursor_skill.exists())
+
+    def test_status_shows_installation_and_hook_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path.cwd() / "src"),
+                "CODEX_HOME": str(tmp_path / "codex-home"),
+                "STYLUS_CURSOR_SKILLS_ROOT": str(tmp_path / "cursor-home" / "skills"),
+                "HOME": str(tmp_path / "home"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+                "STYLUS_HOME": str(tmp_path / "stylus-home"),
+            }
+            subprocess.run([sys.executable, "-m", "stylus", "install", "skill"], cwd=tmp_path, env=env, check=True)
+            subprocess.run([sys.executable, "-m", "stylus", "install", "hook"], cwd=tmp_path, env=env, check=True)
+            subprocess.run([sys.executable, "-m", "stylus", "install", "config"], cwd=tmp_path, env=env, check=True)
+
+            result = subprocess.run(
+                [sys.executable, "-m", "stylus", "status"],
+                cwd=tmp_path, env=env,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            out = result.stdout
+            self.assertIn("codex: installed", out)
+            self.assertIn("cursor: installed", out)
+            self.assertIn("global post-commit hook: installed", out)
+            self.assertIn("core.hooksPath:", out)
+
+    def test_status_shows_baseline_and_preference_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "repo"
+            root.mkdir()
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path.cwd() / "src"),
+                "CODEX_HOME": str(tmp_path / "codex-home"),
+                "HOME": str(tmp_path / "home"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+                "STYLUS_HOME": str(tmp_path / "stylus-home"),
+                "PATH": os.environ.get("PATH", ""),
+            }
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("STYLUS_ANALYZER_CMD", None)
+
+            subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "stylus@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Stylus Test"], cwd=root, check=True)
+            (root / "example.txt").write_text("one\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, stdout=subprocess.PIPE)
+
+            subprocess.run([sys.executable, "-m", "stylus", "init"], cwd=root, env=env, check=True)
+            subprocess.run([sys.executable, "-m", "stylus", "install", "skill"], cwd=root, env=env, check=True)
+            (root / "example.txt").write_text("two\n")
+            subprocess.run(
+                [sys.executable, "-m", "stylus", "record", "--summary", "agent changed text"],
+                cwd=root, env=env, check=True,
+            )
+            (root / "example.txt").write_text("three\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "user correction"], cwd=root, env=env, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                [sys.executable, "-m", "stylus", "analyze", "--commit", "HEAD"],
+                cwd=root, env=env, check=True, stdout=subprocess.PIPE,
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-m", "stylus", "status"],
+                cwd=root, env=env,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            out = result.stdout
+            self.assertIn("Baseline", out)
+            self.assertIn("agent changed text", out)
+            self.assertIn("analyses on this branch:", out)
+            self.assertIn("1 updated", out)
+            self.assertIn("Preferences:", out)
+            self.assertIn("1 preferences", out)
+
+    def test_status_outside_git_repo_skips_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path.cwd() / "src"),
+                "CODEX_HOME": str(tmp_path / "codex-home"),
+                "HOME": str(tmp_path / "home"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+                "STYLUS_HOME": str(tmp_path / "stylus-home"),
+            }
+            result = subprocess.run(
+                [sys.executable, "-m", "stylus", "status"],
+                cwd=tmp_path, env=env,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("not a Git repository", result.stdout)
+
+    def test_list_prints_preferences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root = tmp_path / "repo"
+            root.mkdir()
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path.cwd() / "src"),
+                "CODEX_HOME": str(tmp_path / "codex-home"),
+                "HOME": str(tmp_path / "home"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+                "STYLUS_HOME": str(tmp_path / "stylus-home"),
+                "PATH": os.environ.get("PATH", ""),
+            }
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("STYLUS_ANALYZER_CMD", None)
+
+            subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "stylus@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Stylus Test"], cwd=root, check=True)
+            (root / "example.txt").write_text("one\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, stdout=subprocess.PIPE)
+
+            subprocess.run([sys.executable, "-m", "stylus", "init"], cwd=root, env=env, check=True)
+            subprocess.run([sys.executable, "-m", "stylus", "install", "skill"], cwd=root, env=env, check=True)
+            (root / "example.txt").write_text("two\n")
+            subprocess.run(
+                [sys.executable, "-m", "stylus", "record", "--summary", "agent changed text"],
+                cwd=root, env=env, check=True,
+            )
+            (root / "example.txt").write_text("three\n")
+            subprocess.run(["git", "add", "example.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "user correction"], cwd=root, env=env, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                [sys.executable, "-m", "stylus", "analyze", "--commit", "HEAD"],
+                cwd=root, env=env, check=True, stdout=subprocess.PIPE,
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-m", "stylus", "list"],
+                cwd=root, env=env,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Review user edits", result.stdout)
+
+    def test_list_without_skill_prints_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path.cwd() / "src"),
+                "CODEX_HOME": str(tmp_path / "codex-home"),
+                "HOME": str(tmp_path / "home"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+                "STYLUS_HOME": str(tmp_path / "stylus-home"),
+            }
+            result = subprocess.run(
+                [sys.executable, "-m", "stylus", "list"],
+                cwd=tmp_path, env=env,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("No Stylus skill found", result.stdout)
 
 
 if __name__ == "__main__":

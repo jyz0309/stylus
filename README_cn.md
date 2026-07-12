@@ -51,8 +51,8 @@ Stylus 会观察你如何修改、收窄或纠正 Agent 生成的代码。每次
 
 1. Agent 完成变更后，Stylus 会自动运行 `stylus record`。Stylus 把当前工作区
    diff 捕获为该分支的**基线**。
-2. 你审查、修改，然后 `git commit`。一个非阻塞的 `post-commit` 钩子触发
-   `stylus analyze --commit HEAD`。
+2. 你审查、修改，然后 `git commit`。`post-commit` 钩子启动
+   `stylus analyze --commit HEAD --background`，不会等待 Analyzer 返回。
 3. Stylus 将你的提交与已记录的基线对比，让已配置的 analyzer 提炼出可复用的
    偏好，并合并进已安装的 agent 下的 stylus skill。
 
@@ -113,7 +113,7 @@ stylus record --summary "Agent 修改了 helper"
 
 # 2. 你审查、修改并提交你的修正。
 git commit -m "修正"
-#    ^ post-commit 钩子会自动执行 `stylus analyze --commit HEAD`
+#    ^ post-commit 钩子会在后台启动分析
 ```
 
 完成。下一次该仓库中的 Agent 会话就会读取更新后的偏好。
@@ -134,6 +134,8 @@ stylus <命令> [选项]
   uninstall all        一步移除 skill + hook + 配置
   record               将最近的 Agent 产出 diff 记录为基线
   analyze              分析已提交的修订版本与基线的差异
+  status               显示安装状态、基线和已学偏好摘要
+  list                 打印已学的编码风格偏好
 ```
 
 ### `install skill`
@@ -169,7 +171,8 @@ stylus install skill --target cursor --target zcode
 
 `install hook` 在 `~/.config/stylus/git-hooks/post-commit` 写入全局钩子文件。
 `install config` 将 Git 的全局 `core.hooksPath` 指向该目录。钩子是
-**非阻塞**的：分析失败只会打印警告，提交照常保留。
+**非阻塞**的：它只等待后台进程成功启动，不等待分析完成。分析输出和失败信息会追加到
+`~/.stylus/analysis.log`，提交始终保留。
 
 ### `record`
 
@@ -189,6 +192,31 @@ stylus record --summary "重构 api 客户端" --task "迁移到 v2 sdk"
 ```bash
 stylus analyze --commit HEAD
 stylus analyze --commit HEAD --debug   # 显示提供方、输入大小和输出
+stylus analyze --commit HEAD --background  # 启动后台分析并立即返回
+```
+
+后台模式会在启动独立进程前把 `HEAD` 解析成固定的 commit SHA，之后的新提交不会改变
+本次分析的目标。分析输出会追加到 `~/.stylus/analysis.log`。
+
+### `status`
+
+一次性打印完整状态报告：哪些 agent 已安装 skill、全局 post-commit 钩子和
+`core.hooksPath` 是否配置、当前分支最近记录的基线（含分析次数）、以及已学到的
+偏好条目数。
+
+```bash
+stylus status
+```
+
+当你觉得 Stylus 没动静时跑一下，这是最快确认学习回路是否接好、已积累多少偏好的方式。
+
+### `list`
+
+从 codex skill（单一事实来源）打印已学的编码风格偏好，按 topic 分组并带 confidence
+标记。无需手动打开 skill 文件即可审查 Stylus 学到了什么。
+
+```bash
+stylus list
 ```
 
 ## 配置项
@@ -199,7 +227,7 @@ Stylus 完全通过环境变量配置 —— 无需配置文件。
 | --------------------------- | ---------------------------------------------- | -------------------------------- |
 | `STYLUS_HOME`               | 状态、diff 和证据日志的根目录                  | `~/.stylus`                      |
 | `OPENAI_API_KEY`            | 启用 OpenAI LLM Analyzer                         | *(未设置 → 本地Analyzer)*          |
-| `STYLUS_OPENAI_MODEL`       | OpenAI Analyzer使用的模型名                      | `gpt-5.2`                        |
+| `STYLUS_OPENAI_MODEL`       | OpenAI Analyzer使用的模型名                      | `gpt-5.5`                        |
 | `STYLUS_OPENAI_BASE_URL`    | OpenAI 兼容的 base URL                         | `https://api.openai.com/v1`      |
 | `STYLUS_ANALYZER_CMD`       | 外部Analyzer命令（最高优先级）                   | *(未设置)*                       |
 | `STYLUS_MAX_DIFF_BYTES`     | 发送给Analyzer的单个 diff 字节上限               | `200000`                         |
@@ -356,7 +384,7 @@ Stylus 是采用 `src/` 布局的标准 Python 包。
 git clone https://github.com/jyz0309/stylus.git
 cd stylus
 pip install -e . pytest
-pytest                       # 运行完整测试套件（64 个测试）
+pytest                       # 运行完整测试套件
 ```
 
 ## 贡献指南
